@@ -187,7 +187,6 @@ class MusicAnalyzer(QMainWindow):
             self.status_label.setText(f'MIDI分析出错: {str(e)}')
             self.result_text.setText(f"MIDI分析错误：{str(e)}\n\n{traceback.format_exc()}")
 
-
     def analyze_audio(self, file_path):
         """分析音频文件"""
         try:
