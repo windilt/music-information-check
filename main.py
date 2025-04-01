@@ -5,28 +5,168 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QFileDialog, QTextEdit, QTabWidget,
-                             QTableWidget, QTableWidgetItem, QHeaderView)
-from PyQt5.QtCore import Qt
+                             QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor
 from collections import Counter
 import matplotlib.font_manager as fm
 import mido
 from mido import MidiFile
+import traceback # Moved import to top
 
-# 设置中文字体
-plt.rcParams['font.family'] = ['Source Han Sans']
-plt.rcParams['axes.unicode_minus'] = False
+# --- Font Setup ---
+# Try to set Chinese fonts with fallbacks
+try:
+    # Prioritize Source Han Sans, fallback to common Chinese fonts
+    plt.rcParams['font.family'] = ['Source Han Sans CN', 'SimHei', 'Microsoft YaHei', 'sans-serif']
+    plt.rcParams['axes.unicode_minus'] = False
+    print("Using font:", plt.rcParams['font.family'])
+except Exception as e:
+    print(f"Warning: Could not set preferred Chinese font. Using default. Error: {e}")
+    # Use a generic sans-serif font if others fail
+    plt.rcParams['font.family'] = ['sans-serif']
+    plt.rcParams['axes.unicode_minus'] = False
+
+# --- Analysis Worker Thread ---
+class AnalysisWorker(QThread):
+    """Runs the analysis in a separate thread to avoid freezing the GUI."""
+    # Signals: finished(results_dict), error(error_msg, traceback_str), progress(message)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str, str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = file_path
+        self.file_ext = file_path.lower().split('.')[-1]
+
+    def run(self):
+        """Performs the analysis."""
+        try:
+            self.progress.emit('正在分析...')
+            QApplication.processEvents() # Allow UI updates during setup
+
+            results = {} # Dictionary to hold all analysis results
+            if self.file_ext in ['mid', 'midi']:
+                results = self._analyze_midi()
+            elif self.file_ext in ['wav', 'mp3', 'm4a', 'ogg', 'flac']: # Added flac
+                results = self._analyze_audio()
+            else:
+                raise ValueError(f"不支持的文件格式: .{self.file_ext}")
+
+            self.progress.emit('分析完成')
+            self.finished.emit(results)
+
+        except Exception as e:
+            tb_str = traceback.format_exc()
+            self.error.emit(f'分析过程中出现错误: {str(e)}', tb_str)
+
+    def _analyze_midi(self):
+        """Analyzes a MIDI file and returns results."""
+        notes = []
+        valid_pitches_hz = []
+        tempo = 120.0  # Default BPM
+        duration = 0.0
+        num_tracks = 0
+
+        mid = MidiFile(self.file_path)
+        num_tracks = len(mid.tracks)
+        duration = mid.length
+
+        # Find tempo (use the first encountered tempo)
+        tempo_found = False
+        for track in mid.tracks:
+            for msg in track:
+                if msg.type == 'set_tempo':
+                    tempo = mido.tempo2bpm(msg.tempo)
+                    tempo_found = True
+                    break
+            if tempo_found:
+                break
+
+        # Collect notes
+        for track in mid.tracks:
+            current_time = 0
+            for msg in track:
+                current_time += msg.time # Accumulate time for potential duration calculation later
+                if msg.type == 'note_on' and msg.velocity > 0:
+                    try:
+                        # Use librosa for consistent note naming (e.g., C#4)
+                        note_name = librosa.midi_to_note(msg.note, unicode=False) # Use ASCII sharps (#)
+                        note_hz = librosa.midi_to_hz(msg.note)
+                        notes.append(note_name)
+                        valid_pitches_hz.append(note_hz)
+                    except Exception as note_e:
+                        print(f"Warning: Could not process MIDI note {msg.note}. Error: {note_e}")
+                        continue # Skip problematic notes
+
+        return {
+            'type': 'midi',
+            'notes': notes,
+            'valid_pitches_hz': valid_pitches_hz,
+            'tempo': tempo,
+            'duration': duration,
+            'num_tracks': num_tracks,
+            'sample_rate': None # Not applicable for MIDI
+        }
+
+    def _analyze_audio(self):
+        """Analyzes an audio file and returns results."""
+        self.progress.emit('正在加载音频...')
+        QApplication.processEvents()
+        y, sr = librosa.load(self.file_path, sr=None) # Load with original sample rate
+        duration = librosa.get_duration(y=y, sr=sr)
+
+        self.progress.emit('正在分析BPM...')
+        QApplication.processEvents()
+        # Use a more robust tempo estimation if available, or stick with beat_track
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr) # Remove units='bpm'
+
+        self.progress.emit('正在分析音高...')
+        QApplication.processEvents()
+        # --- Pitch Tracking ---
+        # Note: piptrack is basic. For better results, consider CREPE or YIN algorithms,
+        # but they add complexity and dependencies.
+        pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+
+        notes = []
+        valid_pitches_hz = []
+        # Select pitches with highest magnitude in each frame
+        # This is a simplification and may not be accurate for complex audio
+        for t in range(pitches.shape[1]):
+            index = magnitudes[:, t].argmax()
+            pitch_hz = pitches[index, t]
+            if pitch_hz > 0: # Filter out 0 Hz estimates
+                 try:
+                    # Use librosa for consistent note naming (e.g., C#4)
+                    note_name = librosa.hz_to_note(pitch_hz, unicode=False) # Use ASCII sharps (#)
+                    notes.append(note_name)
+                    valid_pitches_hz.append(pitch_hz)
+                 except Exception as note_e:
+                    print(f"Warning: Could not process pitch {pitch_hz}Hz. Error: {note_e}")
+                    continue # Skip problematic pitches
+
+        return {
+            'type': 'audio',
+            'notes': notes,
+            'valid_pitches_hz': valid_pitches_hz,
+            'tempo': float(tempo), # Ensure tempo is float
+            'duration': duration,
+            'num_tracks': None, # Not applicable for single audio file
+            'sample_rate': sr
+        }
 
 
+# --- Main Application Window ---
 class MusicAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.initUI()
-        self.notes = []
-        self.valid_pitches = []
+        self.notes = [] # Store detected note names (e.g., 'C#4')
+        self.valid_pitches_hz = [] # Store detected pitches in Hz
         self.current_file = ""
+        self.analysis_worker = None # Placeholder for the worker thread
 
-        # 定义音域范围
+        # Vocal ranges using standard note names (ASCII sharps)
         self.vocal_ranges = {
             '男低音': ('E2', 'E4'),
             '男中音': ('G2', 'F4'),
@@ -35,68 +175,80 @@ class MusicAnalyzer(QMainWindow):
             '女中音': ('A3', 'A5'),
             '女高音': ('C4', 'C6')
         }
+        # Pre-calculate Hz ranges for faster comparison
+        self.vocal_ranges_hz = {
+            name: (librosa.note_to_hz(low), librosa.note_to_hz(high))
+            for name, (low, high) in self.vocal_ranges.items()
+        }
+
+        self.initUI()
 
     def initUI(self):
-        self.setWindowTitle('音乐分析器 (支持MIDI/WAV/MP3)')
+        self.setWindowTitle('音乐分析器 (支持MIDI/WAV/MP3/M4A/OGG/FLAC)')
         self.setGeometry(100, 100, 1400, 900)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # 文件选择区域
-        file_layout = QHBoxLayout()
+        # --- Top Controls ---
+        control_layout = QHBoxLayout()
         self.select_button = QPushButton('选择音乐文件', self)
         self.select_button.clicked.connect(self.select_file)
         self.file_label = QLabel('未选择文件')
-        file_layout.addWidget(self.select_button)
-        file_layout.addWidget(self.file_label)
-
-        # 分析按钮
+        self.file_label.setStyleSheet("QLabel { padding-left: 5px; }") # Add padding
         self.analyze_button = QPushButton('开始分析', self)
-        self.analyze_button.clicked.connect(self.analyze_file)
+        self.analyze_button.clicked.connect(self.start_analysis)
         self.analyze_button.setEnabled(False)
 
-        # 状态标签
+        control_layout.addWidget(self.select_button)
+        control_layout.addWidget(self.file_label, 1) # Allow label to stretch
+        control_layout.addWidget(self.analyze_button)
+        main_layout.addLayout(control_layout)
+
+        # --- Status Bar ---
+        status_layout = QHBoxLayout()
         self.status_label = QLabel('准备就绪')
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 0) # Indeterminate progress
+        self.progress_bar.setVisible(False) # Hide initially
+        status_layout.addWidget(self.status_label, 1)
+        status_layout.addWidget(self.progress_bar)
+        main_layout.addLayout(status_layout)
 
-        # 添加控件到主布局
-        main_layout.addLayout(file_layout)
-        main_layout.addWidget(self.analyze_button)
-        main_layout.addWidget(self.status_label)
 
-        # 创建选项卡
+        # --- Tabs ---
         self.tabs = QTabWidget()
 
-        # 第一页：文本结果
+        # Tab 1: Text Results
         self.text_tab = QWidget()
-        self.text_layout = QVBoxLayout()
+        text_layout = QVBoxLayout(self.text_tab)
         self.result_text = QTextEdit()
         self.result_text.setReadOnly(True)
-        self.text_layout.addWidget(self.result_text)
-        self.text_tab.setLayout(self.text_layout)
+        self.result_text.setFontFamily("monospace") # Monospace font for better alignment
+        text_layout.addWidget(self.result_text)
 
-        # 第二页：音符频率表格
+        # Tab 2: Note Frequency Table
         self.table_tab = QWidget()
-        self.table_layout = QVBoxLayout()
+        table_layout = QVBoxLayout(self.table_tab)
         self.note_table = QTableWidget()
-        self.note_table.setColumnCount(13)
+        self.note_table.setColumnCount(13) # Note, Freq(%), +1 to +11 semitones
         headers = ["音符", "频率(%)"] + [f"+{i}半音" for i in range(1, 12)]
         self.note_table.setHorizontalHeaderLabels(headers)
         self.note_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.note_table.horizontalHeader().setStretchLastSection(True)
-        self.table_layout.addWidget(self.note_table)
-        self.table_tab.setLayout(self.table_layout)
+        self.note_table.horizontalHeader().setStretchLastSection(False) # Don't stretch last column
+        self.note_table.setSortingEnabled(True) # Enable sorting
+        self.note_table.setAlternatingRowColors(True) # Improve readability
+        table_layout.addWidget(self.note_table)
 
-        # 第三页：音域直方图
+        # Tab 3: Pitch Histogram Plot
         self.plot_tab = QWidget()
-        self.plot_layout = QVBoxLayout()
+        plot_layout = QVBoxLayout(self.plot_tab)
         self.figure = plt.figure()
         self.canvas = FigureCanvas(self.figure)
-        self.plot_layout.addWidget(self.canvas)
-        self.plot_tab.setLayout(self.plot_layout)
+        plot_layout.addWidget(self.canvas)
 
-        # 添加选项卡
+        # Add tabs
         self.tabs.addTab(self.text_tab, "分析结果")
         self.tabs.addTab(self.table_tab, "音符频率")
         self.tabs.addTab(self.plot_tab, "音域比较")
@@ -104,378 +256,397 @@ class MusicAnalyzer(QMainWindow):
         main_layout.addWidget(self.tabs)
 
     def select_file(self):
+        """Opens a dialog to select a music file."""
         try:
             file_name, _ = QFileDialog.getOpenFileName(
                 self,
                 '选择音乐文件',
                 '',
-                '音频文件 (*.mp3 *.wav *.m4a *.ogg *.mid *.midi);;所有文件 (*)'
+                '音频和MIDI文件 (*.mp3 *.wav *.m4a *.ogg *.flac *.mid *.midi);;所有文件 (*)'
             )
             if file_name:
                 self.current_file = file_name
                 self.file_label.setText(f"已选择: {file_name}")
                 self.analyze_button.setEnabled(True)
-                self.status_label.setText('点击"开始分析"按钮进行分析')
-                # 清空之前的结果
-                self.result_text.clear()
-                self.note_table.setRowCount(0)
-                self.figure.clear()
-                self.canvas.draw()
+                self.status_label.setText('准备分析')
+                # Clear previous results immediately
+                self.clear_results()
         except Exception as e:
             self.status_label.setText(f'文件选择出错: {str(e)}')
+            self.analyze_button.setEnabled(False)
 
-    def analyze_file(self):
-        if not self.current_file:
-            self.status_label.setText('请先选择文件')
-            return
+    def clear_results(self):
+        """Clears all previous analysis results from the UI."""
+        self.result_text.clear()
+        self.note_table.setRowCount(0)
+        self.figure.clear()
+        self.canvas.draw()
+        self.notes = []
+        self.valid_pitches_hz = []
 
-        file_ext = self.current_file.lower().split('.')[-1]
-        try:
-            self.status_label.setText('正在分析...')
-            QApplication.processEvents()
+    def start_analysis(self):
+        """Starts the analysis process in a separate thread."""
+        if not self.current_file or self.analysis_worker is not None:
+            return # Prevent starting if no file or analysis already running
 
-            if file_ext in ['mid', 'midi']:
-                self.analyze_midi(self.current_file)
-            else:
-                self.analyze_audio(self.current_file)
+        self.clear_results() # Clear results before starting new analysis
+        self.analyze_button.setEnabled(False)
+        self.select_button.setEnabled(False) # Disable file selection during analysis
+        self.status_label.setText('正在初始化分析...')
+        self.progress_bar.setVisible(True)
 
-            self.status_label.setText('分析完成')
-        except Exception as e:
-            self.status_label.setText(f'分析出错: {str(e)}')
-            self.result_text.setText(f"错误：{str(e)}\n\n{traceback.format_exc()}")
+        # Create and start the worker thread
+        self.analysis_worker = AnalysisWorker(self.current_file)
+        self.analysis_worker.finished.connect(self.handle_analysis_success)
+        self.analysis_worker.error.connect(self.handle_analysis_error)
+        self.analysis_worker.progress.connect(self.update_status)
+        # Clean up thread when finished
+        self.analysis_worker.finished.connect(self.analysis_complete)
+        self.analysis_worker.error.connect(self.analysis_complete)
+        self.analysis_worker.start()
 
-    def analyze_midi(self, file_path):
-        """分析MIDI文件"""
-        try:
-            self.notes = []
-            self.valid_pitches = []
+    def update_status(self, message):
+        """Updates the status label."""
+        self.status_label.setText(message)
 
-            mid = MidiFile(file_path)
-            tempo = 120  # 默认BPM
+    def handle_analysis_success(self, results):
+        """Handles successful analysis results from the worker thread."""
+        self.status_label.setText('分析完成，正在处理结果...')
+        QApplication.processEvents()
 
-            # 查找设置速度的元消息
-            for track in mid.tracks:
-                for msg in track:
-                    if msg.type == 'set_tempo':
-                        tempo = mido.tempo2bpm(msg.tempo)
-                        break
+        # Store results
+        self.notes = results.get('notes', [])
+        self.valid_pitches_hz = results.get('valid_pitches_hz', [])
 
-            # 收集所有音符
-            for track in mid.tracks:  # 修复：遍历所有轨道
-                for msg in track:
-                    if msg.type == 'note_on' and msg.velocity > 0:
-                        note = librosa.midi_to_note(msg.note)
-                        self.notes.append(note)
-                        self.valid_pitches.append(librosa.note_to_hz(note))
+        # --- Build Text Report ---
+        report = []
+        analysis_type = results.get('type', '未知')
+        report.append(f"{analysis_type.upper()} 分析结果:\n")
+        report.append(f"文件: {self.current_file}\n")
 
-            # 准备分析结果
-            result = "MIDI分析结果：\n\n"
-            result += f"BPM: {tempo:.1f}\n"
-            result += f"轨道数: {len(mid.tracks)}\n"
-            result += f"总时长: {mid.length:.2f}秒\n"
-            result += f"音符总数: {len(self.notes)}\n\n"
+        if results.get('tempo') is not None:
+            report.append(f"估算 BPM: {results['tempo']:.1f}")
+        if results.get('duration') is not None:
+            report.append(f"时长: {results['duration']:.2f} 秒")
+        if results.get('sample_rate') is not None:
+            report.append(f"采样率: {results['sample_rate']} Hz")
+        if results.get('num_tracks') is not None:
+            report.append(f"轨道数: {results['num_tracks']}")
 
-            # 添加音域和音符统计
-            self.add_common_analysis_results(result)
+        report.append(f"检测到的音符事件数: {len(self.notes)}") # Use len(notes) as proxy
 
-            self.result_text.setText(result)
-            self.update_note_table()
-            self.update_pitch_histogram()
+        # --- Add Common Analysis (Range, Key) ---
+        common_analysis_text = self.generate_common_analysis_report()
+        if common_analysis_text:
+            report.append("\n--- 综合分析 ---\n" + common_analysis_text)
 
-        except Exception as e:
-            import traceback
-            self.status_label.setText(f'MIDI分析出错: {str(e)}')
-            self.result_text.setText(f"MIDI分析错误：{str(e)}\n\n{traceback.format_exc()}")
+        self.result_text.setText("\n".join(report))
 
-    def analyze_audio(self, file_path):
-        """分析音频文件"""
-        try:
-            y, sr = librosa.load(file_path)
+        # --- Update Table and Plot ---
+        self.update_note_table()
+        self.update_pitch_histogram()
 
-            # 分析BPM
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        self.status_label.setText('分析完成')
 
-            # 分析音高
-            pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+    def handle_analysis_error(self, error_msg, tb_str):
+        """Handles errors reported by the worker thread."""
+        self.status_label.setText(f'分析失败: {error_msg}')
+        self.result_text.setText(f"分析过程中发生错误:\n\n{error_msg}\n\n详细信息:\n{tb_str}")
+        # Keep plot/table clear or show an error message there? Clear is simpler.
+        self.figure.clear()
+        self.canvas.draw()
+        self.note_table.setRowCount(0)
 
-            # 获取音符
-            self.notes = []
-            self.valid_pitches = []
-            for i in range(pitches.shape[1]):
-                pitch_slice = pitches[:, i]
-                magnitude_slice = magnitudes[:, i]
-                if np.any(magnitude_slice > 0):
-                    max_magnitude_idx = magnitude_slice.argmax()
-                    pitch = pitch_slice[max_magnitude_idx]
-                    if pitch > 0:
-                        note = librosa.hz_to_note(float(pitch))
-                        self.notes.append(str(note))
-                        self.valid_pitches.append(float(pitch))
 
-            # 准备分析结果
-            result = "音频分析结果：\n\n"
-            result += f"BPM: {float(tempo):.1f}\n"
-            result += f"采样率: {sr} Hz\n"
-            result += f"时长: {len(y) / sr:.2f}秒\n\n"
+    def analysis_complete(self):
+        """Called when the worker thread finishes (success or error)."""
+        self.analyze_button.setEnabled(True)
+        self.select_button.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        if self.analysis_worker:
+            # Ensure thread resources are released (though Python's GC usually handles it)
+             self.analysis_worker.quit()
+             self.analysis_worker.wait() # Wait for thread to fully terminate
+        self.analysis_worker = None # Reset worker
 
-            # 添加音域和音符统计
-            self.add_common_analysis_results(result)
 
-            self.result_text.setText(result)
-            self.update_note_table()
-            self.update_pitch_histogram()
+    def generate_common_analysis_report(self):
+        """Generates text report for note frequency, range, and key."""
+        report_parts = []
 
-        except Exception as e:
-            raise Exception(f"音频分析错误: {str(e)}")
-
-    def add_common_analysis_results(self, result):
-        """添加通用的分析结果（音域和音符统计）"""
-        # 音符统计
+        # --- Note Frequency ---
         if self.notes:
             note_counts = Counter(self.notes)
             total_notes = len(self.notes)
-
-            result += "音符出现频率：\n"
-            for note, count in note_counts.most_common():
+            report_parts.append("主要音符频率:")
+            # Show top 5 or up to 10 notes
+            for note, count in note_counts.most_common(10):
                 percentage = (count / total_notes) * 100
-                result += f"{note}: {percentage:.1f}%\n"
+                report_parts.append(f"  {note:<4}: {percentage:>5.1f}% ({count}次)")
+            if len(note_counts) > 10:
+                report_parts.append("  ...")
         else:
-            result += "未检测到音符\n"
+            report_parts.append("未检测到明确的音符事件。")
 
-        # 音域分析
-        if self.valid_pitches:
-            min_pitch = float(np.min(self.valid_pitches))
-            max_pitch = float(np.max(self.valid_pitches))
-            min_note = librosa.hz_to_note(min_pitch)
-            max_note = librosa.hz_to_note(max_pitch)
-            result += f"\n音域范围: {min_note} - {max_note}\n"
+        # --- Pitch Range Analysis ---
+        if self.valid_pitches_hz:
+            min_pitch_hz = float(np.min(self.valid_pitches_hz))
+            max_pitch_hz = float(np.max(self.valid_pitches_hz))
+            min_note = librosa.hz_to_note(min_pitch_hz, unicode=False)
+            max_note = librosa.hz_to_note(max_pitch_hz, unicode=False)
+            report_parts.append(f"\n音域范围 (Hz): {min_pitch_hz:.2f} Hz - {max_pitch_hz:.2f} Hz")
+            report_parts.append(f"音域范围 (音符): {min_note} - {max_note}")
 
-            # 判断音域范围
-            result += "\n音域范围分析:\n"
+            # --- Vocal Range Matching ---
+            report_parts.append("\n人声声部匹配:")
             matched_ranges = []
+            partial_matches = []
 
-            for range_name, (low_note, high_note) in self.vocal_ranges.items():
-                low_hz = librosa.note_to_hz(low_note)
-                high_hz = librosa.note_to_hz(high_note)
-
-                # 检查音域是否完全包含在某个声部范围内
-                if min_pitch >= low_hz and max_pitch <= high_hz:
+            for range_name, (low_hz, high_hz) in self.vocal_ranges_hz.items():
+                # Check for full containment
+                if min_pitch_hz >= low_hz and max_pitch_hz <= high_hz:
                     matched_ranges.append(range_name)
+                else:
+                    # Check for significant overlap
+                    overlap_min = max(min_pitch_hz, low_hz)
+                    overlap_max = min(max_pitch_hz, high_hz)
+                    if overlap_max > overlap_min: # Ensure there is *some* overlap
+                        detected_range_width = max_pitch_hz - min_pitch_hz
+                        if detected_range_width > 1e-6: # Avoid division by zero/very small
+                            overlap_percentage = ((overlap_max - overlap_min) / detected_range_width) * 100
+                            # Define a threshold for "significant" overlap, e.g., 50%
+                            if overlap_percentage >= 50.0:
+                                partial_matches.append(f"{range_name} (重叠 {overlap_percentage:.1f}%)")
+                        # Handle case where detected range is very narrow but overlaps
+                        elif min_pitch_hz >= low_hz and max_pitch_hz <= high_hz:
+                             partial_matches.append(f"{range_name} (窄音域内)")
+
 
             if matched_ranges:
-                result += f"音域完全匹配: {', '.join(matched_ranges)}\n"
-            else:
-                # 如果没有完全匹配的，检查部分匹配
-                for range_name, (low_note, high_note) in self.vocal_ranges.items():
-                    low_hz = librosa.note_to_hz(low_note)
-                    high_hz = librosa.note_to_hz(high_note)
+                report_parts.append(f"  完全匹配: {', '.join(matched_ranges)}")
+            if partial_matches:
+                report_parts.append(f"  部分匹配: {', '.join(partial_matches)}")
+            if not matched_ranges and not partial_matches:
+                report_parts.append("  未显著匹配标准人声声部。")
 
-                    # 检查音域是否有重叠
-                    if (min_pitch <= high_hz and max_pitch >= low_hz):
-                        overlap_min = max(min_pitch, low_hz)
-                        overlap_max = min(max_pitch, high_hz)
-                        overlap_percent = ((overlap_max - overlap_min) / (max_pitch - min_pitch)) * 100
+        else:
+             report_parts.append("\n无法进行音域分析 (未检测到音高)。")
 
-                        if overlap_percent > 50:  # 如果重叠超过50%
-                            result += f"音域部分匹配: {range_name} (重叠{overlap_percent:.1f}%)\n"
 
-                # 如果没有匹配任何范围
-                if not matched_ranges and "部分匹配" not in result:
-                    result += "音域超出典型人声范围\n"
-
-        # 添加音调分析
+        # --- Basic Key Estimation ---
         if self.notes:
-            note_roots = [note.replace('♯', '#')[0] for note in self.notes]
-            root_counts = Counter(note_roots)
-            most_common_root = root_counts.most_common(1)[0][0]
-            result += f"\n可能的调式主音: {most_common_root}"
+            # Extract root note (handle sharps '#' and flats 'b')
+            # Assumes notes like 'C#4', 'Db5' etc.
+            note_roots = [note[:-1].replace('#', '').replace('b', '') for note in self.notes if len(note) > 1]
+            if note_roots:
+                root_counts = Counter(note_roots)
+                most_common_root = root_counts.most_common(1)[0][0]
+                report_parts.append(f"\n可能的调式主音 (基于频率): {most_common_root}")
+            else:
+                report_parts.append("\n无法估算主音 (音符格式不明确)。")
+
+
+        return "\n".join(report_parts)
+
 
     def update_note_table(self):
+        """Populates the note frequency table."""
         if not self.notes:
+            self.note_table.setRowCount(0)
             return
 
         note_counts = Counter(self.notes)
         total_notes = len(self.notes)
 
-        # 获取所有音符并按音高排序
-        unique_notes = list(note_counts.keys())
-        unique_notes.sort(key=lambda x: librosa.note_to_hz(x.replace('♯', '#').replace('♭', 'b')))
+        # Get unique notes and sort them by pitch (using Hz for reliable sorting)
+        # Ensure consistent sharp/flat handling for sorting
+        unique_notes = sorted(
+            list(note_counts.keys()),
+            key=lambda n: librosa.note_to_hz(n) if n else 0 # Handle potential None/empty notes
+        )
 
-        # 准备表格数据
-        table_data = []
-        for note in unique_notes:
+        self.note_table.setRowCount(len(unique_notes))
+        self.note_table.setSortingEnabled(False) # Disable sorting during population
+
+        for row, note in enumerate(unique_notes):
+            if not note: continue # Skip empty entries if any
+
             count = note_counts[note]
             percentage = (count / total_notes) * 100
-            row_data = [note, percentage]
 
-            # 计算升半音对应的音符
-            try:
-                base_note = note.replace('♯', '#').replace('♭', 'b')
-                for i in range(1, 12):  # +1到+11半音
-                    hz = librosa.note_to_hz(base_note)
-                    new_hz = hz * (2 ** (i / 12))
-                    new_note = librosa.hz_to_note(new_hz)
-                    # 统一转换为使用#表示升号
-                    new_note = new_note.replace('♯', '#').replace('♭', 'b')
-                    row_data.append(str(new_note))
-            except:
-                for i in range(1, 12):
-                    row_data.append("N/A")
-
-            table_data.append(row_data)
-
-        # 设置表格行数
-        self.note_table.setRowCount(len(table_data))
-
-        # 填充表格
-        for row, row_data in enumerate(table_data):
-            note = row_data[0]
-
-            # 创建音符单元格并设置颜色
+            # Column 0: Note Name
             note_item = QTableWidgetItem(note)
             note_item.setFlags(note_item.flags() ^ Qt.ItemIsEditable)
-
-            # 设置升降音颜色
-            if '♯' in note or '#' in note:
-                note_item.setBackground(QColor(255, 200, 200))  # 升号用浅红色
-            elif '♭' in note or 'b' in note:
-                note_item.setBackground(QColor(200, 200, 255))  # 降号用浅蓝色
-
-            # 创建频率单元格
-            freq_item = QTableWidgetItem(f"{row_data[1]:.1f}%")
-            freq_item.setData(Qt.DisplayRole, row_data[1])  # 设置排序用的数值
-
-            # 添加到表格
+            # Color coding for sharps/flats
+            if '#' in note:
+                note_item.setBackground(QColor(255, 220, 220)) # Light red for sharp
+            elif 'b' in note:
+                note_item.setBackground(QColor(220, 220, 255)) # Light blue for flat
             self.note_table.setItem(row, 0, note_item)
+
+            # Column 1: Frequency (%) - Store float for sorting
+            freq_item = QTableWidgetItem(f"{percentage:.1f}%")
+            freq_item.setData(Qt.DisplayRole, f"{percentage:.1f}%") # Display text
+            freq_item.setData(Qt.UserRole, percentage) # Store float data for sorting
+            freq_item.setFlags(freq_item.flags() ^ Qt.ItemIsEditable)
+            freq_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.note_table.setItem(row, 1, freq_item)
 
-            # 添加半音转换列
-            for col in range(2, 13):  # 2-12列是+1到+11半音
-                item = QTableWidgetItem(row_data[col])
-                item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+            # Columns 2-12: Semitone Transpositions
+            try:
+                base_hz = librosa.note_to_hz(note)
+                for i in range(1, 12): # +1 to +11 semitones
+                    transposed_hz = base_hz * (2**(i/12.0))
+                    transposed_note = librosa.hz_to_note(transposed_hz, unicode=False) # Use ASCII sharps
+                    item = QTableWidgetItem(transposed_note)
+                    item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+                    # Apply color coding to transposed notes
+                    if '#' in transposed_note:
+                        item.setBackground(QColor(255, 230, 230))
+                    elif 'b' in transposed_note:
+                        item.setBackground(QColor(230, 230, 255))
+                    self.note_table.setItem(row, i + 1, item) # Offset by 1 (col 2 is +1)
+            except Exception as e:
+                print(f"Warning: Could not transpose note {note}. Error: {e}")
+                for i in range(1, 12):
+                    item = QTableWidgetItem("N/A")
+                    item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+                    self.note_table.setItem(row, i + 1, item)
 
-                # 为转换后的升降音也设置颜色
-                converted_note = row_data[col]
-                if '#' in converted_note:
-                    item.setBackground(QColor(255, 200, 200))  # 升号用浅红色
-                elif 'b' in converted_note:
-                    item.setBackground(QColor(200, 200, 255))  # 降号用浅蓝色
-
-                self.note_table.setItem(row, col, item)
-
-        # 设置排序功能
         self.note_table.setSortingEnabled(True)
-        self.note_table.sortByColumn(0, Qt.AscendingOrder)  # 默认按音符音高升序排列
+        # Optional: Sort by note name initially
+        # self.note_table.sortByColumn(0, Qt.AscendingOrder)
+        # Or sort by frequency descending
+        self.note_table.sortByColumn(1, Qt.DescendingOrder)
+
 
     def update_pitch_histogram(self):
-        if len(self.valid_pitches) == 0:
+        """Updates the pitch histogram plot."""
+        self.figure.clear() # Clear previous plot
+
+        if not self.notes:
+            # Optionally display a message on the canvas
+            ax = self.figure.add_subplot(111)
+            ax.text(0.5, 0.5, '无音符数据可供绘图', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
+            self.canvas.draw()
             return
 
-        self.figure.clear()
+        # Use self.notes which should be populated correctly now
+        note_counts = Counter(self.notes)
 
-        # 创建主图，调整底部空间以容纳声部标记
+        # Sort notes by pitch for the x-axis
+        sorted_unique_notes = sorted(
+            list(note_counts.keys()),
+            key=lambda n: librosa.note_to_hz(n) if n else 0
+        )
+        counts = [note_counts[note] for note in sorted_unique_notes]
+
+        # --- Plotting ---
         ax = self.figure.add_subplot(111)
-        self.figure.subplots_adjust(bottom=0.3)  # 增加底部空间
+        # Adjust bottom margin to make space for range labels
+        self.figure.subplots_adjust(bottom=0.3, right=0.80) # Adjust right for legend
 
-        # 将频率转换为音符
-        note_names = [librosa.hz_to_note(p) for p in self.valid_pitches]
-        unique_notes = sorted(list(set(note_names)), key=lambda x: librosa.note_to_hz(x))
-
-        # 统计每个音符出现的次数
-        note_counts = Counter(note_names)
-        counts = [note_counts[note] for note in unique_notes]
-
-        # 绘制柱状图（先绘制数据）
-        bars = ax.bar(range(len(unique_notes)), counts, color='skyblue', edgecolor='black', alpha=0.8)
-        ax.set_xticks(range(len(unique_notes)))
-        ax.set_xticklabels(unique_notes)
-
-        # 定义不同声部的颜色（带透明度）
-        range_colors = {
-            '男低音': (0.68, 0.85, 0.90, 0.5),  # lightblue 带50%透明度
-            '男中音': (0.0, 0.0, 1.0, 0.5),  # blue 带50%透明度
-            '男高音': (0.0, 0.0, 0.55, 0.5),  # darkblue 带50%透明度
-            '女低音': (1.0, 0.75, 0.8, 0.5),  # pink 带50%透明度
-            '女中音': (1.0, 0.0, 0.0, 0.5),  # red 带50%透明度
-            '女高音': (0.55, 0.0, 0.0, 0.5)  # darkred 带50%透明度
-        }
-
-        # 准备范围标记数据
-        range_data = []
-        for range_name, (low_note, high_note) in self.vocal_ranges.items():
-            try:
-                low_hz = librosa.note_to_hz(low_note)
-                high_hz = librosa.note_to_hz(high_note)
-
-                # 找到范围内的音符索引
-                start_idx = None
-                end_idx = None
-                for i, note in enumerate(unique_notes):
-                    note_hz = librosa.note_to_hz(note)
-                    if start_idx is None and note_hz >= low_hz:
-                        start_idx = i
-                    if note_hz <= high_hz:
-                        end_idx = i
-                    elif note_hz > high_hz:
-                        break
-
-                if start_idx is not None and end_idx is not None:
-                    range_data.append({
-                        'name': range_name,
-                        'start': start_idx,
-                        'end': end_idx,
-                        'color': range_colors[range_name]
-                    })
-            except:
-                continue
-
-        # 在图表底部创建声部范围标记（半透明）
-        for i, range_info in enumerate(range_data):
-            # 计算每个声部标记的y位置（从0.02开始，每个声部间隔0.08）
-            y_pos = 0.02 + (i * 0.08)
-
-            # 绘制半透明范围标记（不遮挡数据）
-            ax.broken_barh(
-                [(range_info['start'], range_info['end'] - range_info['start'] + 1)],
-                (y_pos, 0.06),  # 高度设为0.06
-                facecolors=range_info['color'],  # 使用带透明度的颜色
-                edgecolor=(0.2, 0.2, 0.2, 0.7),  # 半透明边框
-                linewidth=0.8,
-                transform=ax.get_xaxis_transform(),
-                label=range_info['name']
-            )
-
-        # 设置轴标签
+        # Bar chart for note counts
+        indices = np.arange(len(sorted_unique_notes))
+        bars = ax.bar(indices, counts, color='skyblue', edgecolor='black', alpha=0.8, label='出现次数')
+        ax.set_xticks(indices)
+        ax.set_xticklabels(sorted_unique_notes, rotation=45, ha='right', fontsize=8) # Smaller font if many notes
         ax.set_xlabel('音符')
         ax.set_ylabel('出现次数')
-        ax.set_title('音域分布（按音符）')
+        ax.set_title('音符频率分布与人声声部比较')
+        ax.grid(axis='y', linestyle='--', alpha=0.6)
 
-        # 添加图例（放在图表右侧）
-        legend_handles = []
-        for range_info in range_data:
-            legend_handles.append(plt.Rectangle(
-                (0, 0), 1, 1,
-                fc=range_info['color'],
-                label=range_info['name'],
-                alpha=0.5  # 图例也保持半透明
-            ))
-        ax.legend(handles=legend_handles,
-                  loc='upper left',
-                  bbox_to_anchor=(1.02, 1),
-                  framealpha=0.7)  # 图例背景半透明
+        # --- Vocal Range Overlays ---
+        # Define colors with alpha for overlays
+        range_colors = {
+            '男低音': (0.68, 0.85, 0.90, 0.3), '男中音': (0.0, 0.0, 1.0, 0.3), '男高音': (0.0, 0.0, 0.55, 0.3),
+            '女低音': (1.0, 0.75, 0.8, 0.3), '女中音': (1.0, 0.0, 0.0, 0.3), '女高音': (0.55, 0.0, 0.0, 0.3)
+        }
+        legend_handles = [] # For custom legend
 
-        # 旋转x轴标签
-        plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+        # Calculate y-positions for range labels dynamically
+        num_ranges = len(self.vocal_ranges_hz)
+        y_step = 0.06 # Height of each range bar in relative coords
+        y_gap = 0.01  # Gap between range bars
+        total_range_height = num_ranges * y_step + (num_ranges - 1) * y_gap
+        y_start = 0.02 # Starting y-position from bottom
 
-        # 调整布局防止标签重叠
-        self.figure.tight_layout(rect=[0, 0, 0.85, 1])  # 为图例留出空间
+        # Map note names to indices for plotting ranges
+        note_to_index = {note: i for i, note in enumerate(sorted_unique_notes)}
+
+        for i, (range_name, (low_hz, high_hz)) in enumerate(self.vocal_ranges_hz.items()):
+            # Find the indices corresponding to the range
+            start_idx = -1
+            end_idx = -1
+            for note, idx in note_to_index.items():
+                note_hz = librosa.note_to_hz(note)
+                if start_idx == -1 and note_hz >= low_hz:
+                    start_idx = idx
+                if note_hz <= high_hz:
+                    end_idx = idx
+                # Optimization: if current note is already above range, break early
+                # (assumes sorted_unique_notes)
+                # if note_hz > high_hz and start_idx != -1:
+                #      break # No need to check further notes for this range
+
+            if start_idx != -1 and end_idx != -1 and start_idx <= end_idx:
+                # Calculate position and width for broken_barh
+                # Add 0.5 to center the bar visually over the indices
+                x_start = start_idx - 0.5
+                x_width = (end_idx - start_idx) + 1
+
+                # Calculate y position for this range bar
+                y_pos = y_start + i * (y_step + y_gap)
+
+                # Draw the semi-transparent range bar using axis coordinates for y
+                ax.broken_barh(
+                    [(x_start, x_width)],
+                    (y_pos, y_step), # y position and height in relative coords
+                    facecolors=range_colors[range_name],
+                    edgecolor=(0.2, 0.2, 0.2, 0.5),
+                    linewidth=0.8,
+                    transform=ax.get_xaxis_transform() # Key: X=data coords, Y=axis coords
+                )
+                # Add range name text slightly above the bar
+                # ax.text(x_start + x_width / 2, y_pos + y_step / 2, range_name,
+                #         ha='center', va='center', fontsize=7, color='black',
+                #         transform=ax.get_xaxis_transform()) # Also use transform
+
+            # Create proxy artist for the legend
+            legend_handles.append(plt.Rectangle((0, 0), 1, 1, fc=range_colors[range_name], label=range_name))
+
+
+        # Add legend outside the plot area
+        ax.legend(handles=legend_handles, title="声部范围",
+                  loc='upper left', bbox_to_anchor=(1.02, 1), borderaxespad=0.)
+
+        # Final adjustments
+        # self.figure.tight_layout(rect=[0, 0.05, 0.85, 0.95]) # Adjust rect to fit legend/labels
+        ax.margins(x=0.02) # Add small margin to x-axis
 
         self.canvas.draw()
+
+    def closeEvent(self, event):
+        """Ensure worker thread is stopped on close."""
+        if self.analysis_worker and self.analysis_worker.isRunning():
+            print("Attempting to stop analysis worker...")
+            # You might want to signal the worker to stop gracefully if possible
+            # For now, we just quit and wait briefly
+            self.analysis_worker.quit()
+            if not self.analysis_worker.wait(1000): # Wait max 1 sec
+                 print("Warning: Analysis worker did not stop gracefully.")
+                 # self.analysis_worker.terminate() # Force terminate if needed (use with caution)
+        event.accept()
 
 
 def main():
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
+    # Optional: Apply a style for better look and feel
+    try:
+        app.setStyle('Fusion')
+    except Exception as e:
+        print(f"Could not set Fusion style: {e}")
+
     ex = MusicAnalyzer()
     ex.show()
     sys.exit(app.exec_())
