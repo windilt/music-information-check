@@ -18,3 +18,7 @@ check the music file or midi file information
     由直方图表示的每个音符出现次数，并且跟人声的音域做了比较
     
   如果扒旋律谱的话，输入最好是midi文件，其次是去除了和声和混响的人声（可以参考MSST-WebUI项目）
+  
+![主界面](https://github.com/windilt/music-information-check/blob/main/screenshot1.png)
+![结果1](https://github.com/windilt/music-information-check/blob/main/screenshot2.png)
+![结果2](https://github.com/windilt/music-information-check/blob/main/screenshot3.png)
